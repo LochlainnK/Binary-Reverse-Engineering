@@ -36,15 +36,41 @@ import hcfg  # noqa: E402
 ZIP_PASSWORD = b"infected"
 
 
+def _cjson(obj):
+    """Compact JSON (no spaces) as the grader expects for array answers."""
+    return json.dumps(obj, separators=(",", ":"))
+
+
 # --------------------------------------------------------------------------
 # artifact download + extraction
 # --------------------------------------------------------------------------
-def download_artifact(challenge, work):
-    raw = gm._get({"op": "artifact", "challenge": challenge})
-    path = os.path.join(work, "artifact.zip")
+def download_artifact(challenge, work, delivery=None):
+    params = {"op": "artifact", "challenge": challenge}
+    if delivery is not None:
+        params["delivery"] = delivery
+    raw = gm._get(params)
+    suffix = f"_{delivery}" if delivery is not None else ""
+    path = os.path.join(work, f"artifact{suffix}.zip")
     with open(path, "wb") as fh:
         fh.write(raw)
     return path
+
+
+def _download_sets(challenge, set_ids, work):
+    """Download & extract one delivery per set, concurrently. Returns {set_idx: files}."""
+    import concurrent.futures as cf
+    out = {}
+
+    def one(idx):
+        d = os.path.join(work, f"set{idx}")
+        os.makedirs(d, exist_ok=True)
+        zp = download_artifact(challenge, d, delivery=idx)
+        return idx, extract(zp, d)
+
+    with cf.ThreadPoolExecutor(max_workers=len(set_ids)) as ex:
+        for idx, files in ex.map(one, set_ids):
+            out[idx] = files
+    return out
 
 
 def extract(zip_path, work):
@@ -184,11 +210,11 @@ class Specimen:
                 return "none"
             return str(e.recover_constant())
         if field in ("section_names", "analysis_section_names"):
-            return json.dumps([s for s in e.section_names()])
+            return _cjson([s["name"] for s in e.sections])
         if field in ("symbols", "analysis_symbols"):
-            return json.dumps(sorted({s["name"] for s in e.symbols() if s["name"]}))
+            return _cjson([s["name"] for s in e.symbols() if s["name"]])
         if field in ("disassembly", "analysis_disassembly"):
-            return str(e.recover_constant())
+            return _cjson(e.recover_disasm())
         # --- C++ ---
         if field in ("has_cpp_vtable", "analysis_has_cpp_vtable"):
             return "true" if self.cpp["has_cpp_vtable"] else "false"
@@ -207,14 +233,17 @@ class Specimen:
             return c.json.get("url") if c and c.json else None
         if field in ("mutex", "analysis_config_mutex"):
             return c.json.get("mutex") if c and c.json else None
-        if field in ("cpp_config_crc32", "config_crc32_hex", "analysis_config_crc32_hex",
-                     "crc32_hex"):
-            return f"{c.crc32:08x}" if c else None
-        if field in ("cpp_xor_key", "xor_key_hex", "analysis_xor_key_hex"):
-            return f"{c.xor_key:02x}" if c else None
-        if field in ("hcfg_version", "analysis_hcfg_version", "metadata_version",
-                     "analysis_metadata_version"):
+        # Both schemes want lowercase hex with a 0x prefix (confirmed for the
+        # day-2 standalone fields and specified for the dNN `_hex` fields).
+        if field in ("cpp_config_crc32", "config_crc32", "crc32",
+                     "config_crc32_hex", "analysis_config_crc32_hex", "crc32_hex"):
+            return f"0x{c.crc32:08x}" if c else None
+        if field in ("cpp_xor_key", "xor_key", "xor_key_hex", "analysis_xor_key_hex"):
+            return f"0x{c.xor_key:02x}" if c else None
+        if field in ("hcfg_version", "analysis_hcfg_version"):
             return str(c.version) if c else None
+        if field in ("metadata_version", "analysis_metadata_version"):
+            return self._dotnet_metadata_version()
         if field in ("hcfg_offset", "analysis_hcfg_offset"):
             if not c:
                 return None
@@ -223,8 +252,8 @@ class Specimen:
             if e:
                 return "true" if any(s["name"] == ".hcfg" for s in e.sections) else "false"
             return "false"
-        if field == "compression_methods" or field == "analysis_compression_methods":
-            return json.dumps(jar_compression_methods(self.path))
+        if field in ("compression_methods", "analysis_compression_methods"):
+            return _cjson(jar_compression_methods(self.path))
         # --- hashes handled at a higher level (needs file selection) ---
         return None
 
@@ -237,6 +266,17 @@ class Specimen:
             return "JAR"
         return format_label(self.path)
 
+    def _dotnet_metadata_version(self):
+        """Extract the CLI metadata version string (e.g. 'v4.0.30319') from a
+        .NET PE by locating the metadata root signature 0x424A5342 ('BSJB')."""
+        i = self.data.find(b"BSJB")
+        if i < 0:
+            return "none"
+        # BSJB(4) major(2) minor(2) reserved(4) version_len(4) version...
+        vlen = struct.unpack_from("<I", self.data, i + 12)[0]
+        ver = self.data[i + 16:i + 16 + vlen].split(b"\x00")[0]
+        return ver.decode("latin1") or "none"
+
     def _pe_machine(self):
         mz = struct.unpack_from("<I", self.data, 0x3c)[0]
         m = struct.unpack_from("<H", self.data, mz + 4)[0]
@@ -246,73 +286,88 @@ class Specimen:
 # --------------------------------------------------------------------------
 # answer_id routing
 # --------------------------------------------------------------------------
-def pick_file(files, token):
-    """Map a slot/day token to an artifact file path.
-    token like 'slot0' / 'slot-0' / 'd03' / 'c' / 'cpp'."""
-    names = list(files)
-    m = re.match(r"slot[-_]?(\d+)", token)
+def split_id(aid):
+    """Return (set_idx, token, field).
+
+    set_idx is 0-based delivery index from a ``setN.`` prefix (None if absent).
+    token groups slotN / dNN / c / cpp; field is the rest.
+    """
+    set_idx = None
+    m = re.match(r"set(\d+)\.(.+)", aid)
     if m:
-        n = m.group(1)
-        for nm in names:
-            if re.search(rf"slot[-_]?{n}\b|slot[-_]?{n}\.", nm):
-                return files[nm]
-    m = re.match(r"d(\d+)", token)
-    if m:
-        dd = int(m.group(1))
-        cands = [nm for nm in names if re.search(rf"d0*{dd}[-_.]", nm)
-                 and not nm.endswith(".runtimeconfig.json")]
-        if cands:
-            return files[sorted(cands)[0]]
-    # day2 standalone: 'c' -> day01 elf, 'cpp' -> day02 elf
-    if token == "c":
-        for nm in sorted(names):
-            if "day01" in nm or "d01" in nm:
-                return files[nm]
-    if token == "cpp":
-        for nm in sorted(names):
-            if "day02" in nm or "d02" in nm:
-                return files[nm]
+        set_idx = int(m.group(1)) - 1
+        aid = m.group(2)
+    for rx in (r"(slot\d+)_(.+)", r"(d\d+)_(.+)", r"(c|cpp)_(.+)"):
+        m = re.match(rx, aid)
+        if m:
+            return set_idx, m.group(1), m.group(2)
+    return set_idx, None, aid
+
+
+def _find(files, *patterns):
+    for nm in sorted(files):
+        if any(re.search(p, nm, re.I) for p in patterns):
+            return files[nm]
     return None
 
 
-def split_id(aid):
-    """Return (token, field). token groups slotN / dNN; field is the rest."""
-    m = re.match(r"(slot\d+)_(.+)", aid)
+def route_file(token, field, files):
+    """Map an answer id (token+field) to the artifact file it concerns."""
+    names = sorted(files)
+    # slot scheme
+    m = re.match(r"slot(\d+)", token or "")
     if m:
-        return m.group(1), m.group(2)
-    m = re.match(r"(d\d+)_(.+)", aid)
+        return _find(files, rf"slot[-_]?{m.group(1)}[-_.]")
+    # cumulative dNN scheme
+    m = re.match(r"d(\d+)", token or "")
     if m:
-        return m.group(1), m.group(2)
-    m = re.match(r"(c|cpp)_(.+)", aid)
-    if m:
-        return m.group(1), m.group(2)
-    return None, aid
+        dd = int(m.group(1))
+        return _find(files, rf"d0*{dd}[-_.](?!.*runtimeconfig)", rf"day0*{dd}[-_.]")
+    # standalone day-2 scheme: explicit c_/cpp_ tokens
+    if token == "c":
+        return _find(files, r"(^|[^p])d(ay)?0*1[-_.]", r"-c\.elf$", r"\bc\.elf$") or \
+               _find(files, r"day0*1", r"d0*1[-_.]")
+    if token == "cpp":
+        return _find(files, r"cpp")
+    # bare fields: config / C++ fields belong to the primary specimen
+    cpp_fields = {"campaign", "domain", "url", "mutex", "has_cpp_vtable",
+                  "has_cpp_typeinfo", "mangled_score_symbol", "vtable_symbol",
+                  "cpp_xor_key", "cpp_config_crc32", "cpp_format", "cpp_sha256"}
+    if field in cpp_fields:
+        return _find(files, r"cpp") or _find(files, r"day0*2", r"d0*2[-_.]")
+    # otherwise the lone / first non-aux file
+    non_aux = [files[n] for n in names if not n.endswith(".runtimeconfig.json")]
+    return non_aux[0] if non_aux else (files[names[0]] if names else None)
 
 
-def solve(answer_ids, files, questions=None):
-    """Compute answers for every id. Returns (answers, notes)."""
-    qmap = {q["id"]: q for q in (questions or [])}
+def solve(answer_ids, files_or_sets, questions=None):
+    """Compute answers for every id. Returns (answers, notes).
+
+    ``files_or_sets`` is either a {name: path} dict (single delivery) or a
+    {set_idx: {name: path}} dict when answer ids carry ``setN.`` prefixes.
+    """
     specimens = {}
     def spec(path):
         if path not in specimens:
             specimens[path] = Specimen(path)
         return specimens[path]
 
-    # order files for day/standalone sha256 and 'artifact_sha256_K'
-    sorted_files = sorted(files.items())
+    def files_for(set_idx):
+        if set_idx is None:
+            return files_or_sets if not _is_setmap(files_or_sets) else files_or_sets.get(0, {})
+        return files_or_sets.get(set_idx, {})
+
     answers, notes = {}, {}
     for aid in answer_ids:
-        token, field = split_id(aid)
+        set_idx, token, field = split_id(aid)
+        files = files_for(set_idx)
         try:
-            # sha256 fields
-            if field in ("sha256", "c_sha256", "cpp_sha256") or re.match(r"artifact_sha256_\d+", field) or field == "artifact_sha256":
+            if field in ("sha256", "c_sha256", "cpp_sha256") or \
+               re.match(r"artifact_sha256(_\d+)?$", field):
                 path = _sha_target(aid, token, field, files)
                 answers[aid] = sha256_file(path) if path else None
                 continue
-            path = pick_file(files, token) if token else _standalone_file(field, files)
-            if path is None:
-                # single-file artifact fallback
-                path = sorted_files[0][1] if sorted_files else None
+            path = route_file(token, field, files)
             answers[aid] = spec(path).answer(field) if path else None
         except Exception as ex:  # noqa: BLE001
             answers[aid] = None
@@ -320,8 +375,12 @@ def solve(answer_ids, files, questions=None):
     return answers, notes
 
 
+def _is_setmap(d):
+    return isinstance(d, dict) and all(isinstance(k, int) for k in d) and d
+
+
 def _sha_target(aid, token, field, files):
-    # dNN_artifact_sha256_K -> the K-th artifact file for day NN
+    # dNN_artifact_sha256_K -> the K-th artifact file for day NN (sorted by name)
     m = re.match(r"d(\d+)", token or "")
     if m:
         dd = int(m.group(1))
@@ -331,17 +390,14 @@ def _sha_target(aid, token, field, files):
         if 0 <= idx < len(cands):
             return files[cands[idx]]
         return files[cands[0]] if cands else None
-    if field == "c_sha256":
-        return _standalone_file("c", files)
-    if field == "cpp_sha256":
-        return _standalone_file("cpp", files)
-    # generic single file
+    # standalone day-2: route by the c_/cpp_ token
+    if token in ("c", "cpp"):
+        return route_file(token, field, files)
+    # slot scheme sha256 (if ever asked)
+    if (token or "").startswith("slot"):
+        return route_file(token, field, files)
     sf = sorted(files.items())
     return sf[0][1] if sf else None
-
-
-def _standalone_file(token, files):
-    return pick_file(files, token)
 
 
 # --------------------------------------------------------------------------
@@ -379,10 +435,17 @@ def main():
     print(f"[+] attempt {start.get('attempt_id')} mode={start.get('mode')} "
           f"nq={len(answer_ids)} deadline={deadline} rem={start.get('unique_attempts_remaining')}")
 
-    # 2+3 download & extract
-    zp = download_artifact(a.challenge, work)
-    files = extract(zp, work)
-    print(f"[+] artifact files: {sorted(files)} ({time.time()-t0:.2f}s)")
+    # 2+3 download & extract (one delivery per set, in parallel)
+    set_ids = sorted({int(m.group(1)) - 1
+                      for aid in answer_ids
+                      for m in [re.match(r"set(\d+)\.", aid)] if m})
+    if set_ids:
+        files = _download_sets(a.challenge, set_ids, work)
+        total = sum(len(v) for v in files.values())
+        print(f"[+] {len(set_ids)} sets, {total} files ({time.time()-t0:.2f}s)")
+    else:
+        files = extract(download_artifact(a.challenge, work), work)
+        print(f"[+] artifact files: {sorted(files)} ({time.time()-t0:.2f}s)")
 
     # 4. solve
     answers, notes = solve(answer_ids, files, start.get("questions"))
@@ -393,7 +456,7 @@ def main():
         overrides[k] = v
     if overrides:
         for aid in list(answers):
-            _, field = split_id(aid)
+            _, _, field = split_id(aid)
             if field in overrides:
                 answers[aid] = overrides[field]
     # restrict submission set for probing
@@ -414,8 +477,9 @@ def main():
         print(json.dumps(answers, indent=1))
         return
 
-    # 5. submit
-    res = json.loads(gm._post({"challenge": a.challenge, "answers": answers}).decode())
+    # 5. submit (never send null answers)
+    payload_ans = {k: v for k, v in answers.items() if v is not None}
+    res = json.loads(gm._post({"challenge": a.challenge, "answers": payload_ans}).decode())
     elapsed = time.time() - t0
     summary = {k: res.get(k) for k in ("result", "remaining", "correct", "incorrect",
                                        "score", "message", "flag", "hall_of_fame_eligible")

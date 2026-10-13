@@ -72,8 +72,30 @@ def _valid(blob):
     return (zlib.crc32(pl) & 0xffffffff) == crc and b'"campaign"' in pl
 
 
+_B64CHARS = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
+
+def _b64_at(data, i):
+    """Extend a base64 token starting at i and decode it."""
+    j = i
+    n = len(data)
+    while j < n and data[j] in _B64CHARS:
+        j += 1
+    tok = data[i:j]
+    tok += b"=" * ((4 - len(tok) % 4) % 4)
+    try:
+        return base64.b64decode(tok)
+    except Exception:
+        return b""
+
+
 def _scan_bytes(data):
-    """Yield Config objects found directly in *data* (raw or base64 carriers)."""
+    """Yield Config objects found directly in *data* (raw or base64 carriers).
+
+    Fast path: literal ``HCFG`` (raw) and ``SENG`` (= base64 of "HCF...") byte
+    searches, which are C-speed even on 60+ MB binaries. Only if neither hits
+    do we fall back to the full base64 regex (small files, odd alignment).
+    """
     # raw literal HCFG blobs
     start = 0
     while True:
@@ -84,7 +106,21 @@ def _scan_bytes(data):
             yield Config(data[i:i + 12 + struct.unpack('<H', data[i+6:i+8])[0]],
                          carrier='raw', file_offset=i)
         start = i + 1
-    # base64-encoded HCFG blobs
+    # base64-encoded HCFG blobs: a blob begins "HCFG" -> base64 begins "SENG"
+    start = 0
+    hit = False
+    while True:
+        i = data.find(b'SENG', start)
+        if i < 0:
+            break
+        blob = _b64_at(data, i)
+        if _valid(blob):
+            yield Config(blob, carrier='base64', b64_offset=i)
+            hit = True
+        start = i + 1
+    if hit:
+        return
+    # fallback: full regex (only reached for small/odd inputs)
     for m in B64_RE.finditer(data):
         try:
             blob = base64.b64decode(m.group())

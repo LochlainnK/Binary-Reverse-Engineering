@@ -7,6 +7,7 @@ presence, the custom ``.huntress`` marker, and the ``recover_code`` constant.
 Falls back to ``readelf``/``objdump`` only for x86 disassembly of the recovery
 constant.
 """
+import re
 import struct
 import subprocess
 
@@ -219,6 +220,38 @@ class ELF:
         except Exception:
             pass
         return None
+
+
+    def recover_disasm(self):
+        """Instructions of the recover symbol as a list of strings (Intel), in
+        execution order, no addresses/bytes. Empty list if the symbol is absent."""
+        sym = self.recover_symbol()
+        if not sym:
+            return []
+        size = sym.get("size") or 32
+        start = sym["value"]
+        try:
+            out = subprocess.check_output(
+                ["objdump", "-d", self.path, "-M", "intel",
+                 f"--start-address=0x{start:x}", f"--stop-address=0x{start + size:x}"],
+                text=True, stderr=subprocess.DEVNULL)
+        except Exception:
+            return []
+        insns = []
+        for line in out.splitlines():
+            # objdump lines: "  <addr>:\t<bytes>\t<insn>"
+            if "\t" not in line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            insn = re.sub(r"\s+", " ", parts[2].strip())
+            insn = insn.split("#")[0].strip()  # drop trailing comments
+            if insn:
+                insns.append(insn)
+            if insn == "ret" or insn.startswith(("ret", "jmp")):
+                break
+        return insns
 
 
 def format_label(path):
