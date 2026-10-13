@@ -1,0 +1,8 @@
+# secrets & transient artifacts — never commit
+*.token
+token.txt
+.hctf_curl.cfg
+__pycache__/
+*.pyc
+scratch/
+artifacts/
