@@ -94,6 +94,7 @@ def _run_incremental(challenge, start, answer_ids, set_ids, work, t0):
           f"elapsed={time.time()-t0:.2f}s")
     with open(os.path.join(work, "result.json"), "w") as fh:
         json.dump(res, fh, indent=1)
+    return res.get("result")
 
 
 def _download_sets(challenge, set_ids, work):
@@ -487,37 +488,55 @@ def main():
     ap.add_argument("--only", default=None, help="regex: submit only matching answer_ids")
     ap.add_argument("--override", action="append", default=[],
                     help="field=value: force a field's answer across all slots/days")
+    ap.add_argument("--attempts", type=int, default=1,
+                    help="for mastery: retry the whole bundle up to N times until CORRECT")
     a = ap.parse_args()
 
     t0 = time.time()
-    work = a.work or os.path.join("/tmp", f"as_{int(t0)}_{os.getpid()}")
-    os.makedirs(work, exist_ok=True)
+    base_work = a.work or os.path.join("/tmp", f"as_{int(t0)}_{os.getpid()}")
+    os.makedirs(base_work, exist_ok=True)
+    work = base_work
+
+    def open_attempt():
+        payload = {"op": "retry", "challenge": a.challenge} if a.retry else {"challenge": a.challenge}
+        if a.run_for_time:
+            payload["run_for_time"] = True
+        return json.loads(gm._post(payload).decode())
 
     # 1. open attempt
-    payload = {"challenge": a.challenge}
-    if a.retry:
-        payload = {"op": "retry", "challenge": a.challenge}
-    if a.run_for_time:
-        payload["run_for_time"] = True
-    start = json.loads(gm._post(payload).decode())
+    start = open_attempt()
     answer_ids = start.get("answer_ids") or [q["id"] for q in start.get("questions", [])]
-    deadline = start.get("deadline")
     if not answer_ids:
         print(json.dumps({"stage": "start", "resp": start}, indent=2)[:2000])
         return
     print(f"[+] attempt {start.get('attempt_id')} mode={start.get('mode')} "
-          f"nq={len(answer_ids)} deadline={deadline} rem={start.get('unique_attempts_remaining')}")
+          f"nq={len(answer_ids)} deadline={start.get('deadline')} "
+          f"rem={start.get('unique_attempts_remaining')}")
 
-    # 2+3 download & extract (one delivery per set, in parallel)
     set_ids = sorted({int(m.group(1)) - 1
                       for aid in answer_ids
                       for m in [re.match(r"set(\d+)\.", aid)] if m})
 
     # Mastery with multiple sets on a tight timer: run each set's
     # download -> solve -> submit in its own thread so correct answers bank as
-    # soon as they're ready, instead of waiting for one big submit at the end.
+    # soon as they're ready. Optionally retry the whole bundle until CORRECT.
     if set_ids and not a.dry_run and not a.only and not a.override:
-        _run_incremental(a.challenge, start, answer_ids, set_ids, work, t0)
+        for n in range(1, max(1, a.attempts) + 1):
+            if n > 1:
+                t0 = time.time()
+                start = open_attempt()
+                answer_ids = start.get("answer_ids") or []
+                set_ids = sorted({int(m.group(1)) - 1 for aid in answer_ids
+                                  for m in [re.match(r"set(\d+)\.", aid)] if m})
+                print(f"[+] attempt #{n} rem={start.get('unique_attempts_remaining')}")
+            work = os.path.join(base_work, f"try{n}")
+            os.makedirs(work, exist_ok=True)
+            res = _run_incremental(a.challenge, start, answer_ids, set_ids, work, t0)
+            if res in ("CORRECT", "already_solved"):
+                print(f"[✓] solved on attempt #{n}")
+                return
+            if n < a.attempts:
+                print(f"[!] attempt #{n} => {res}; retrying")
         return
 
     if set_ids:
