@@ -56,6 +56,46 @@ def download_artifact(challenge, work, delivery=None):
     return path
 
 
+def _run_incremental(challenge, start, answer_ids, set_ids, work, t0):
+    """Per-set pipeline: each set downloads, solves and submits in its own
+    thread so correct answers bank the instant they're ready. A final combined
+    submit (all sets) tips the attempt to CORRECT once everything is in."""
+    import threading
+    questions = start.get("questions")
+    by_set = {}
+    for aid in answer_ids:
+        m = re.match(r"set(\d+)\.", aid)
+        by_set.setdefault(int(m.group(1)) - 1 if m else 0, []).append(aid)
+    all_answers = {}
+    lock = threading.Lock()
+    results = {}
+
+    def one(idx):
+        d = os.path.join(work, f"set{idx}")
+        os.makedirs(d, exist_ok=True)
+        files = extract(download_artifact(challenge, d, delivery=idx), d)
+        ans, _ = solve(by_set[idx], {idx: files}, questions)
+        payload = {k: v for k, v in ans.items() if v is not None}
+        res = json.loads(gm._post({"challenge": challenge, "answers": payload}).decode())
+        with lock:
+            all_answers.update(payload)
+            results[idx] = res.get("result")
+        print(f"[set{idx+1}] {len(payload)}/{len(by_set[idx])} submitted -> "
+              f"{res.get('result')} rem={res.get('remaining')} ({time.time()-t0:.2f}s)")
+
+    threads = [threading.Thread(target=one, args=(i,)) for i in set_ids]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    # final combined submit to settle the attempt (idempotent for banked answers)
+    res = json.loads(gm._post({"challenge": challenge, "answers": all_answers}).decode())
+    print(f"[=] final: {res.get('result')} rem={res.get('remaining')} "
+          f"elapsed={time.time()-t0:.2f}s")
+    with open(os.path.join(work, "result.json"), "w") as fh:
+        json.dump(res, fh, indent=1)
+
+
 def _download_sets(challenge, set_ids, work):
     """Download & extract one delivery per set, concurrently. Returns {set_idx: files}."""
     import concurrent.futures as cf
@@ -178,11 +218,16 @@ class Specimen:
         return self._cpp
 
     # --- generic field answerer --------------------------------------------
-    def answer(self, field):
+    def answer(self, field, fmt=None):
         e = self.elf
         c = self.cfg
+        kind = (fmt or {}).get("kind")
         # --- container / arch ---
         if field in ("elf_class", "analysis_elf_class"):
+            if not e:
+                return "none"
+            if kind == "integer":           # some days want the bare class number
+                return "64" if e.is64 else "32"
             return e.elf_class()
         if field in ("endianness", "analysis_endianness"):
             return e.endianness()
@@ -193,7 +238,8 @@ class Specimen:
         if field in ("elf_type", "analysis_elf_type"):
             return e.elf_type()
         if field in ("format", "analysis_format", "cpp_format"):
-            return self._format()
+            # managed (.NET) specimens want a compound container+runtime token
+            return self._format(compound=self._is_dotnet())
         if field in ("entry_point", "analysis_entry_point"):
             return e.entry_point()
         # --- symbols / markers ---
@@ -249,22 +295,48 @@ class Specimen:
                 return None
             return str(c.file_offset if c.file_offset is not None else c.b64_offset)
         if field in ("has_hcfg_section", "analysis_has_hcfg_section"):
-            if e:
-                return "true" if any(s["name"] == ".hcfg" for s in e.sections) else "false"
-            return "false"
+            return "true" if self._has_hcfg_section() else "false"
         if field in ("compression_methods", "analysis_compression_methods"):
             return _cjson(jar_compression_methods(self.path))
         # --- hashes handled at a higher level (needs file selection) ---
         return None
 
-    def _format(self):
+    def _is_dotnet(self):
+        return self.kind == "pe" and b"BSJB" in self.data
+
+    def _format(self, compound=False):
         if self.kind == "elf":
             return self.elf.elf_class()           # ELF64 / ELF32
         if self.kind == "pe":
-            return format_label(self.path)        # PE32 / PE32+
+            pe = format_label(self.path)          # PE32 / PE32+
+            if compound and self._is_dotnet():
+                return f"{pe}/.NET"               # managed: container + runtime
+            return pe
         if self.kind == "zip":
             return "JAR"
         return format_label(self.path)
+
+    def _pe_section_names(self):
+        d = self.data
+        pe = struct.unpack_from("<I", d, 0x3c)[0]
+        nsec = struct.unpack_from("<H", d, pe + 6)[0]
+        optsz = struct.unpack_from("<H", d, pe + 20)[0]
+        secoff = pe + 24 + optsz
+        out = []
+        for i in range(nsec):
+            name = d[secoff + i * 40:secoff + i * 40 + 8].rstrip(b"\x00")
+            out.append(name.decode("latin1", "replace"))
+        return out
+
+    def _has_hcfg_section(self):
+        if self.kind == "elf" and self.elf:
+            return any(s["name"] == ".hcfg" for s in self.elf.sections)
+        if self.kind == "pe":
+            try:
+                return ".hcfg" in self._pe_section_names()
+            except Exception:
+                return False
+        return False
 
     def _dotnet_metadata_version(self):
         """Extract the CLI metadata version string (e.g. 'v4.0.30319') from a
@@ -357,6 +429,7 @@ def solve(answer_ids, files_or_sets, questions=None):
             return files_or_sets if not _is_setmap(files_or_sets) else files_or_sets.get(0, {})
         return files_or_sets.get(set_idx, {})
 
+    qmap = {q["id"]: q.get("answer_format") for q in (questions or [])}
     answers, notes = {}, {}
     for aid in answer_ids:
         set_idx, token, field = split_id(aid)
@@ -368,7 +441,7 @@ def solve(answer_ids, files_or_sets, questions=None):
                 answers[aid] = sha256_file(path) if path else None
                 continue
             path = route_file(token, field, files)
-            answers[aid] = spec(path).answer(field) if path else None
+            answers[aid] = spec(path).answer(field, qmap.get(aid)) if path else None
         except Exception as ex:  # noqa: BLE001
             answers[aid] = None
             notes[aid] = f"ERR {type(ex).__name__}: {ex}"
@@ -439,6 +512,14 @@ def main():
     set_ids = sorted({int(m.group(1)) - 1
                       for aid in answer_ids
                       for m in [re.match(r"set(\d+)\.", aid)] if m})
+
+    # Mastery with multiple sets on a tight timer: run each set's
+    # download -> solve -> submit in its own thread so correct answers bank as
+    # soon as they're ready, instead of waiting for one big submit at the end.
+    if set_ids and not a.dry_run and not a.only and not a.override:
+        _run_incremental(a.challenge, start, answer_ids, set_ids, work, t0)
+        return
+
     if set_ids:
         files = _download_sets(a.challenge, set_ids, work)
         total = sum(len(v) for v in files.values())
