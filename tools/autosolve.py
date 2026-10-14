@@ -607,10 +607,12 @@ def main():
                     help="field=value: force a field's answer across all slots/days")
     ap.add_argument("--attempts", type=int, default=1,
                     help="for mastery: retry the whole bundle up to N times until CORRECT")
+    ap.add_argument("--practice", action="store_true",
+                    help="open an untimed practice attempt (after fresh variants are spent)")
     a = ap.parse_args()
     run_attempt(a.challenge, retry=a.retry, run_for_time=a.run_for_time,
                 dry_run=a.dry_run, only=a.only, override=a.override,
-                attempts=a.attempts, work=a.work)
+                attempts=a.attempts, work=a.work, practice=a.practice)
 
 
 if __name__ == "__main__":
