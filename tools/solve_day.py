@@ -112,6 +112,13 @@ def main():
             s = autosolve.run_attempt(ids["time_trial"], retry=True,
                                       attempts=a.tt_attempts,
                                       work=os.path.join(base_work, "tt"))
+            # Timed window missed and no fresh variants left -> finish it untimed
+            # via practice (still completes the mode and unlocks mastery).
+            if s.get("result") not in ("CORRECT", "already_solved", "incorrect"):
+                print("[~] time trial not solved in the timed window; "
+                      "falling back to untimed practice to complete it.")
+                s = autosolve.run_attempt(ids["time_trial"], practice=True,
+                                          work=os.path.join(base_work, "tt_practice"))
             tt_ok = s.get("result") in ("CORRECT", "already_solved")
             tt_blocked = s.get("result") == "incorrect"   # a real wrong answer
             print(f"[=] time_trial => {s.get('result')}")

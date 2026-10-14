@@ -239,7 +239,11 @@ class Specimen:
         if field in ("elf_type", "analysis_elf_type"):
             return e.elf_type()
         if field in ("format", "analysis_format", "cpp_format"):
-            # managed (.NET) specimens want a compound container+runtime token
+            if kind == "exact_text":
+                # exact_text format wants the lowercase container token (e.g. "elf")
+                return {"elf": "elf", "pe": "pe", "zip": "jar"}.get(
+                    self.kind, (self._format() or "").lower())
+            # pattern: managed (.NET) specimens want a compound container+runtime token
             return self._format(compound=self._is_dotnet())
         if field in ("entry_point", "analysis_entry_point"):
             return e.entry_point()
@@ -478,7 +482,7 @@ def _sha_target(aid, token, field, files):
 # main loop
 # --------------------------------------------------------------------------
 def run_attempt(challenge, *, retry=False, run_for_time=False, dry_run=False,
-                only=None, override=None, attempts=1, work=None):
+                only=None, override=None, attempts=1, work=None, practice=False):
     """Open an attempt, solve it, and (unless dry_run) submit.
 
     Returns a summary dict: {result, mode, nq, solved, missing, elapsed, flag,
@@ -493,10 +497,21 @@ def run_attempt(challenge, *, retry=False, run_for_time=False, dry_run=False,
     os.makedirs(base_work, exist_ok=True)
 
     def open_attempt():
-        payload = {"op": "retry", "challenge": challenge} if retry else {"challenge": challenge}
+        if practice:
+            payload = {"op": "practice", "challenge": challenge}
+        else:
+            payload = {"op": "retry", "challenge": challenge} if retry else {"challenge": challenge}
         if run_for_time:
             payload["run_for_time"] = True
-        return json.loads(gm._post(payload).decode())
+        resp = json.loads(gm._post(payload).decode())
+        # Freshly-released challenges have no prior attempt, so `retry` fails with
+        # start_required — open the first (fresh, scored) attempt with a plain start.
+        if retry and resp.get("error") == "start_required":
+            sp = {"challenge": challenge}
+            if run_for_time:
+                sp["run_for_time"] = True
+            resp = json.loads(gm._post(sp).decode())
+        return resp
 
     start = open_attempt()
     answer_ids = start.get("answer_ids") or [q["id"] for q in start.get("questions", [])]

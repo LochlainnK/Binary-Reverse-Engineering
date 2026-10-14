@@ -6,10 +6,22 @@ assigned artifacts, reverse-engineers them from the real bytes, and submits the
 answers — fast enough to beat the server-enforced countdown on Time Trial and
 Mastery attempts.
 
-**Status:** Mastery modes for Days 8, 9 and 10 solve `CORRECT` fully
-automated (~14–16 s each); Day 1 Time Trial solves `CORRECT` in ~6 s. The
-extractor covers every released day (1–13) and generalises to unseen days of
-the same family.
+**Status:** Mastery modes for Days 8, 9, 10 and 14 solve `CORRECT` fully
+automated (~9–16 s each); Day 1 and Day 14 Time Trials solve `CORRECT`. The
+extractor covers every released day (1–14) and generalises to unseen days of
+the same family. Day 14 ("Objective-C") was a live proof of generalisation:
+it needed only one new calibration — `format` as `exact_text` wants lowercase
+`elf` — surfaced in the untimed single_solve stage, after which mastery
+one-shot.
+
+**Progression gating:** a day's timed modes are locked behind prerequisites —
+`single_solve` (scored, untimed) must be `CORRECT` to unlock `time_trial`,
+which in turn unlocks `mastery`. A freshly-released day answers `retry` with
+`start_required` (use a plain `start` for the first attempt) and may answer
+`start` with `prerequisite_required` until the earlier mode is solved. Once a
+day's fresh timed variants are spent (`unique_attempts_remaining` 0), `op=practice`
+gives an untimed attempt that still completes the mode (and satisfies the
+prerequisite). `solve_day.py` walks this chain automatically.
 
 ---
 
@@ -112,8 +124,9 @@ solver is format-aware. Calibrated canonical values:
 | `symbols` | compact JSON array of `.symtab` names | |
 | `disassembly` | compact JSON array of `recover_code` instructions | `[]` if stripped |
 | `xor_key_hex` / `config_crc32_hex` | `0x` + lowercase hex | both schemes |
-| `format` (ELF/PE) | `ELF64` / `PE32` / `PE32+` / `JAR` | |
-| `format` (managed .NET, compound) | `PE32/.NET` | container **and** runtime |
+| `format` (`pattern`) | `ELF64` / `PE32` / `PE32+` / `JAR` | bitness-qualified |
+| `format` (`exact_text`) | lowercase container token: `elf` / `pe` / `jar` | days 12+ |
+| `format` (managed .NET, compound `pattern`) | `PE32/.NET` | container **and** runtime |
 | `metadata_version` (.NET) | `v4.0.30319` | from `BSJB` metadata root |
 | `hcfg_version` | `1` | HCFG version byte |
 | `hcfg_offset` | file offset of the HCFG blob (raw) or the base64 token (encoded) | |
