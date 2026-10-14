@@ -477,6 +477,108 @@ def _sha_target(aid, token, field, files):
 # --------------------------------------------------------------------------
 # main loop
 # --------------------------------------------------------------------------
+def run_attempt(challenge, *, retry=False, run_for_time=False, dry_run=False,
+                only=None, override=None, attempts=1, work=None):
+    """Open an attempt, solve it, and (unless dry_run) submit.
+
+    Returns a summary dict: {result, mode, nq, solved, missing, elapsed, flag,
+    work, sets}. Mastery (multi-set) uses the parallel incremental pipeline and
+    honours ``attempts`` (retry the whole bundle until CORRECT); other modes do
+    a single solve+submit. This is the reusable entry point used by the
+    per-day orchestrator (solve_day.py).
+    """
+    override = override or []
+    t0 = time.time()
+    base_work = work or os.path.join("/tmp", f"as_{int(t0)}_{os.getpid()}")
+    os.makedirs(base_work, exist_ok=True)
+
+    def open_attempt():
+        payload = {"op": "retry", "challenge": challenge} if retry else {"challenge": challenge}
+        if run_for_time:
+            payload["run_for_time"] = True
+        return json.loads(gm._post(payload).decode())
+
+    start = open_attempt()
+    answer_ids = start.get("answer_ids") or [q["id"] for q in start.get("questions", [])]
+    mode = start.get("mode")
+    if not answer_ids:
+        print(json.dumps({"stage": "start", "resp": start}, indent=2)[:2000])
+        return {"result": start.get("result"), "mode": mode, "nq": 0}
+    print(f"[+] {challenge.split('/')[-1]}: mode={mode} nq={len(answer_ids)} "
+          f"deadline={start.get('deadline')} rem={start.get('unique_attempts_remaining')}")
+
+    def set_ids_of(aids):
+        return sorted({int(m.group(1)) - 1 for aid in aids
+                       for m in [re.match(r"set(\d+)\.", aid)] if m})
+
+    set_ids = set_ids_of(answer_ids)
+
+    # --- mastery (multi-set, parallel, incremental, retry-until-CORRECT) -----
+    if set_ids and not dry_run and not only and not override:
+        for n in range(1, max(1, attempts) + 1):
+            if n > 1:
+                t0 = time.time()
+                start = open_attempt()
+                answer_ids = start.get("answer_ids") or []
+                set_ids = set_ids_of(answer_ids)
+                print(f"[+] attempt #{n} rem={start.get('unique_attempts_remaining')}")
+            w = os.path.join(base_work, f"try{n}")
+            os.makedirs(w, exist_ok=True)
+            res = _run_incremental(challenge, start, answer_ids, set_ids, w, t0)
+            if res in ("CORRECT", "already_solved"):
+                print(f"[✓] solved on attempt #{n}")
+                return {"result": res, "mode": mode, "nq": len(answer_ids),
+                        "sets": len(set_ids), "elapsed": time.time() - t0, "work": w}
+            if n < attempts:
+                print(f"[!] attempt #{n} => {res}; retrying")
+        return {"result": res, "mode": mode, "nq": len(answer_ids),
+                "sets": len(set_ids), "elapsed": time.time() - t0, "work": base_work}
+
+    # --- single delivery (single_solve / time_trial / cumulative) ------------
+    if set_ids:
+        files = _download_sets(challenge, set_ids, base_work)
+        print(f"[+] {len(set_ids)} sets ({time.time()-t0:.2f}s)")
+    else:
+        files = extract(download_artifact(challenge, base_work), base_work)
+        print(f"[+] files: {sorted(files)} ({time.time()-t0:.2f}s)")
+
+    answers, notes = solve(answer_ids, files, start.get("questions"))
+    overrides = dict(ov.partition("=")[::2] for ov in override)
+    if overrides:
+        for aid in list(answers):
+            _, _, field = split_id(aid)
+            if field in overrides:
+                answers[aid] = overrides[field]
+    if only:
+        rx = re.compile(only)
+        answers = {k: v for k, v in answers.items() if rx.search(k)}
+    missing = [k for k, v in answers.items() if v is None]
+    print(f"[+] solved {len(answers)-len(missing)}/{len(answers)} in {time.time()-t0:.2f}s")
+    if missing:
+        print(f"[!] NO ANSWER for: {missing[:20]}{' …' if len(missing) > 20 else ''}")
+    if notes:
+        print(f"[!] notes: {json.dumps(notes, indent=0)[:1000]}")
+    with open(os.path.join(base_work, "answers.json"), "w") as fh:
+        json.dump(answers, fh, indent=1)
+
+    summary = {"mode": mode, "nq": len(answer_ids), "solved": len(answers) - len(missing),
+               "missing": missing, "elapsed": time.time() - t0, "work": base_work}
+    if dry_run:
+        summary["result"] = "dry-run"
+        return summary
+
+    payload_ans = {k: v for k, v in answers.items() if v is not None}
+    res = json.loads(gm._post({"challenge": challenge, "answers": payload_ans}).decode())
+    summary["result"] = res.get("result")
+    summary["flag"] = res.get("flag")
+    summary["remaining"] = res.get("remaining")
+    print(f"[=] result in {time.time()-t0:.2f}s: "
+          f"{json.dumps({k: res.get(k) for k in ('result','remaining','flag') if k in res})}")
+    with open(os.path.join(base_work, "result.json"), "w") as fh:
+        json.dump(res, fh, indent=1)
+    return summary
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("challenge")
@@ -491,104 +593,9 @@ def main():
     ap.add_argument("--attempts", type=int, default=1,
                     help="for mastery: retry the whole bundle up to N times until CORRECT")
     a = ap.parse_args()
-
-    t0 = time.time()
-    base_work = a.work or os.path.join("/tmp", f"as_{int(t0)}_{os.getpid()}")
-    os.makedirs(base_work, exist_ok=True)
-    work = base_work
-
-    def open_attempt():
-        payload = {"op": "retry", "challenge": a.challenge} if a.retry else {"challenge": a.challenge}
-        if a.run_for_time:
-            payload["run_for_time"] = True
-        return json.loads(gm._post(payload).decode())
-
-    # 1. open attempt
-    start = open_attempt()
-    answer_ids = start.get("answer_ids") or [q["id"] for q in start.get("questions", [])]
-    if not answer_ids:
-        print(json.dumps({"stage": "start", "resp": start}, indent=2)[:2000])
-        return
-    print(f"[+] attempt {start.get('attempt_id')} mode={start.get('mode')} "
-          f"nq={len(answer_ids)} deadline={start.get('deadline')} "
-          f"rem={start.get('unique_attempts_remaining')}")
-
-    set_ids = sorted({int(m.group(1)) - 1
-                      for aid in answer_ids
-                      for m in [re.match(r"set(\d+)\.", aid)] if m})
-
-    # Mastery with multiple sets on a tight timer: run each set's
-    # download -> solve -> submit in its own thread so correct answers bank as
-    # soon as they're ready. Optionally retry the whole bundle until CORRECT.
-    if set_ids and not a.dry_run and not a.only and not a.override:
-        for n in range(1, max(1, a.attempts) + 1):
-            if n > 1:
-                t0 = time.time()
-                start = open_attempt()
-                answer_ids = start.get("answer_ids") or []
-                set_ids = sorted({int(m.group(1)) - 1 for aid in answer_ids
-                                  for m in [re.match(r"set(\d+)\.", aid)] if m})
-                print(f"[+] attempt #{n} rem={start.get('unique_attempts_remaining')}")
-            work = os.path.join(base_work, f"try{n}")
-            os.makedirs(work, exist_ok=True)
-            res = _run_incremental(a.challenge, start, answer_ids, set_ids, work, t0)
-            if res in ("CORRECT", "already_solved"):
-                print(f"[✓] solved on attempt #{n}")
-                return
-            if n < a.attempts:
-                print(f"[!] attempt #{n} => {res}; retrying")
-        return
-
-    if set_ids:
-        files = _download_sets(a.challenge, set_ids, work)
-        total = sum(len(v) for v in files.values())
-        print(f"[+] {len(set_ids)} sets, {total} files ({time.time()-t0:.2f}s)")
-    else:
-        files = extract(download_artifact(a.challenge, work), work)
-        print(f"[+] artifact files: {sorted(files)} ({time.time()-t0:.2f}s)")
-
-    # 4. solve
-    answers, notes = solve(answer_ids, files, start.get("questions"))
-    # apply field overrides (force a given field's value across every slot/day)
-    overrides = {}
-    for ov in a.override:
-        k, _, v = ov.partition("=")
-        overrides[k] = v
-    if overrides:
-        for aid in list(answers):
-            _, _, field = split_id(aid)
-            if field in overrides:
-                answers[aid] = overrides[field]
-    # restrict submission set for probing
-    if a.only:
-        rx = re.compile(a.only)
-        answers = {k: v for k, v in answers.items() if rx.search(k)}
-    missing = [k for k, v in answers.items() if v is None]
-    print(f"[+] solved {len(answers)-len(missing)}/{len(answers)} in {time.time()-t0:.2f}s")
-    if missing:
-        print(f"[!] NO ANSWER for: {missing}")
-    if notes:
-        print(f"[!] notes: {json.dumps(notes, indent=0)[:1000]}")
-
-    with open(os.path.join(work, "answers.json"), "w") as fh:
-        json.dump(answers, fh, indent=1)
-
-    if a.dry_run:
-        print(json.dumps(answers, indent=1))
-        return
-
-    # 5. submit (never send null answers)
-    payload_ans = {k: v for k, v in answers.items() if v is not None}
-    res = json.loads(gm._post({"challenge": a.challenge, "answers": payload_ans}).decode())
-    elapsed = time.time() - t0
-    summary = {k: res.get(k) for k in ("result", "remaining", "correct", "incorrect",
-                                       "score", "message", "flag", "hall_of_fame_eligible")
-               if k in res}
-    print(f"[=] result in {elapsed:.2f}s: {json.dumps(summary)}")
-    # persist full response for inspection
-    with open(os.path.join(work, "result.json"), "w") as fh:
-        json.dump(res, fh, indent=1)
-    print(f"[i] work dir: {work}")
+    run_attempt(a.challenge, retry=a.retry, run_for_time=a.run_for_time,
+                dry_run=a.dry_run, only=a.only, override=a.override,
+                attempts=a.attempts, work=a.work)
 
 
 if __name__ == "__main__":

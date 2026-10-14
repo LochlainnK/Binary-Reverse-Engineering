@@ -145,16 +145,33 @@ though the `mov eax,imm; ret` stub is still in `.text`).
 ```bash
 export HUNTRESS_GM_TOKEN_FILE=/path/to/token.txt   # 600, never committed
 
-# Solve a Mastery bundle on a fresh scored variant:
-python3 tools/autosolve.py \
-  'binary-reverse-engineering-day-10-zig-cross-platform-services/mastery' --retry
+# Recommended: orchestrate a whole day in the right order
+#   single_solve (untimed coverage)  ->  time_trial (scored)  ->  mastery (parallel)
+python3 tools/solve_day.py 10 --tt-attempts 3 --mastery-attempts 3
+python3 tools/solve_day.py 14            # a future day, once released
+python3 tools/solve_day.py 10 --from mastery   # skip straight to mastery
+```
 
-# Solve a Time Trial:
-python3 tools/autosolve.py \
-  'binary-reverse-engineering-day-01-c-elf-orientation/time_trial' --retry
+`solve_day.py` resolves the day's three challenge ids and runs the stages so
+each informs the next:
 
-# Inspect without submitting:
-python3 tools/autosolve.py '<challenge-id>' --retry --dry-run
+1. **single_solve** — untimed. Dry-runs the solver over the day's artifact and
+   reports any field with no answer. A new, unseen field type surfaces here,
+   with no clock running.
+2. **time_trial** — scored. Validates the answer formats for real. It *gates*
+   mastery: a genuine `incorrect` stops the run (don't burn scarce mastery
+   variants on a mis-calibrated solver), while a mere `expired` (big artifact
+   vs short timer) is treated as a timing artifact and lets mastery proceed.
+3. **mastery** — scored, multi-delivery, downloaded and submitted **in
+   parallel**, retried up to `--mastery-attempts` until `CORRECT`.
+
+The single-challenge tool underneath it:
+
+```bash
+# One mode directly:
+python3 tools/autosolve.py '<id>/mastery'    --retry --attempts 3
+python3 tools/autosolve.py '<id>/time_trial' --retry
+python3 tools/autosolve.py '<id>'            --retry --dry-run   # inspect, no submit
 ```
 
 `--retry` spends one `unique_attempts_remaining` for a fresh scored attempt;
