@@ -6,10 +6,16 @@ assigned artifacts, reverse-engineers them from the real bytes, and submits the
 answers — fast enough to beat the server-enforced countdown on Time Trial and
 Mastery attempts.
 
-**Status:** Mastery modes for Days 8, 9 and 10 solve `CORRECT` fully
-automated (~14–16 s each); Day 1 Time Trial solves `CORRECT` in ~6 s. The
-extractor covers every released day (1–13) and generalises to unseen days of
-the same family.
+**Status:** Mastery modes for Days 8, 9, 10 and 15 solve `CORRECT` fully
+automated (~15 s each); Day 1 Time Trial solves `CORRECT` in ~6 s. The
+extractor covers every released day (1–15) and generalises to unseen days of
+the same family. Day 15 adds a **paired stripped/symbolized specimen** per day
+(`dNN--variant-*-stripped.elf` + `-symbolized.elf`); the solver routes each
+`stripped_`/`symbolized_` field to its build and the two `artifact_sha256`
+fields to symbolized (`_1`) then stripped (`_2`).
+
+**Dependency:** `pip install -r requirements.txt` — `pyzipper` is required to
+decrypt the WinZip-AES evidence archives (stdlib `zipfile` cannot).
 
 ---
 
@@ -34,9 +40,14 @@ through `--config -` (stdin) so it never appears in process arguments.
 | Artifact | `GET ?op=artifact&challenge=<id>[&delivery=N]` |
 | Submit | `POST {"challenge":"<id>","answers":{...}}` |
 
-Modes: **single_solve** (untimed, globally already solved → *not scored*, but
-serves the artifact + question contract for practice), **time_trial** (timed,
-one specimen family), **mastery** (timed bundle of many tasks).
+Modes: **single_solve** (untimed; a correct solve earns the flag + points and,
+for a newly released day, is the **prerequisite** that unlocks the day's
+time_trial/mastery — until it is solved those return `prerequisite_required` /
+`start_required`), **time_trial** (one specimen family), **mastery** (bundle of
+many tasks). time_trial and mastery are scored but **untimed by default**
+(`deadline: null`); pass `run_for_time: true` on start/retry only for a timed
+Hall-of-Fame attempt. Open a fresh scored attempt with a plain start first;
+`op:retry` only works once an attempt exists (it buys a fresh variant).
 
 ---
 
@@ -80,8 +91,10 @@ decoys) are rejected automatically:
   which gives a fast byte-search locator even in 60 MB+ binaries)
 * **inside a JAR** — a Base64 constant within a `.class` entry
 
-Archives are AES-encrypted ZIPs; the password is **`infected`** (the standard
-malware-sample convention).
+Archives are AES-encrypted ZIPs (WinZip AES, ZIP compression method 99); the
+password is **`infected`** (the standard malware-sample convention). The
+stdlib `zipfile` cannot decrypt these, so **`pyzipper`** is required (see
+`requirements.txt`); the extractor falls back to stdlib only for plain ZIPs.
 
 ---
 
@@ -100,6 +113,7 @@ solver is format-aware. Calibrated canonical values:
 |-------|-------|-------|
 | `elf_class` (exact_text) | `ELF64` / `ELF32` | |
 | `elf_class` (integer) | `64` / `32` | e.g. `d08_analysis_elf_class` |
+| `machine` / `architecture` (integer) | `62` (= `0x3e`, x86-64) | raw `e_machine` code; e.g. `d15_analysis_*_machine` |
 | `endianness` | `little` / `big` | not "little endian" |
 | `machine` / `architecture` | `x86-64` | pattern, lenient |
 | `elf_type` | `ET_EXEC` (`ET_` prefix) | |
@@ -112,7 +126,8 @@ solver is format-aware. Calibrated canonical values:
 | `symbols` | compact JSON array of `.symtab` names | |
 | `disassembly` | compact JSON array of `recover_code` instructions | `[]` if stripped |
 | `xor_key_hex` / `config_crc32_hex` | `0x` + lowercase hex | both schemes |
-| `format` (ELF/PE) | `ELF64` / `PE32` / `PE32+` / `JAR` | |
+| `format` (ELF) | `elf` | lowercase family token; the **only** value accepted from day 12 on (early days also took `ELF64`). Width lives in `elf_class`. |
+| `format` (PE/JAR) | `PE32` / `PE32+` / `JAR` | |
 | `format` (managed .NET, compound) | `PE32/.NET` | container **and** runtime |
 | `metadata_version` (.NET) | `v4.0.30319` | from `BSJB` metadata root |
 | `hcfg_version` | `1` | HCFG version byte |

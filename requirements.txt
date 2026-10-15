@@ -1,0 +1,7 @@
+# Runtime dependency for the Binary RE solver toolkit.
+#
+# pyzipper decrypts the WinZip-AES (compression method 99) evidence archives the
+# Game Master serves. Python's stdlib zipfile cannot read AES ZIPs, so without
+# this the extractor fails with "That compression method is not supported".
+# Install in a fresh environment with:  pip install -r requirements.txt
+pyzipper>=0.3.6
