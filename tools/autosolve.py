@@ -279,7 +279,14 @@ class Specimen:
                 return "none"
             return str(e.recover_constant())
         if field in ("section_names", "analysis_section_names"):
-            return _cjson([s["name"] for s in e.sections])
+            if e:
+                return _cjson([s["name"] for s in e.sections])
+            if self.kind == "pe":
+                try:
+                    return _cjson(self._pe_section_names())
+                except Exception:
+                    return "none"
+            return "none"
         if field in ("symbols", "analysis_symbols"):
             return _cjson([s["name"] for s in e.symbols() if s["name"]])
         if field in ("disassembly", "analysis_disassembly"):
@@ -290,9 +297,9 @@ class Specimen:
         if field in ("has_cpp_typeinfo", "analysis_has_cpp_typeinfo"):
             return "true" if self.cpp["has_cpp_typeinfo"] else "false"
         if field in ("vtable_symbol", "analysis_vtable_symbol"):
-            return self.cpp["vtable_symbol"]
+            return self._first_symbol_matching(r"ZTV.*DiscoveryEngine")
         if field in ("mangled_score_symbol", "analysis_mangled_score_symbol"):
-            return self.cpp["score_symbol"]
+            return self._first_symbol_matching(r"DiscoveryEngine.*score")
         # --- config (HCFG) ---
         if field in ("campaign", "analysis_config_campaign"):
             return c.json.get("campaign") if c and c.json else None
@@ -400,15 +407,45 @@ class Specimen:
 
     def _first_symbol_matching(self, pat):
         rx = re.compile(pat)
-        for n in self._symnames():
+        if self.kind == "pe":
+            for n in self._coff_symbols():   # raw COFF table order, prefixes kept
+                if rx.search(n):
+                    return n
+            return "none"
+        for n in self._symnames():           # ELF .symtab order
             if rx.search(n):
                 return n
-        # PE / fallback: scan raw for mangled names
-        for m in re.finditer(rb"[A-Za-z_][\w$.@]{3,120}", self.data):
-            s = m.group().decode("latin1")
-            if rx.search(s):
-                return s
         return "none"
+
+    def _coff_symbols(self):
+        """COFF symbol names in raw table order (long names resolved via the
+        string table; section prefixes like .rdata$ kept; empty names dropped)."""
+        d = self.data
+        try:
+            pe = struct.unpack_from("<I", d, 0x3c)[0]
+            sym_ptr = struct.unpack_from("<I", d, pe + 4 + 8)[0]
+            nsym = struct.unpack_from("<I", d, pe + 4 + 12)[0]
+        except Exception:
+            return []
+        if not sym_ptr or not nsym:
+            return []
+        strtab = sym_ptr + nsym * 18
+        out = []
+        i = 0
+        while i < nsym:
+            off = sym_ptr + i * 18
+            raw = d[off:off + 8]
+            if raw[:4] == b"\x00\x00\x00\x00":
+                so = struct.unpack_from("<I", d, off + 4)[0]
+                end = d.index(b"\x00", strtab + so)
+                name = d[strtab + so:end].decode("latin1", "replace")
+            else:
+                name = raw.rstrip(b"\x00").decode("latin1", "replace")
+            if name:
+                out.append(name)
+            naux = d[off + 17]
+            i += 1 + naux
+        return out
 
     def _text_bytes(self):
         if self.kind == "elf" and self.elf:
