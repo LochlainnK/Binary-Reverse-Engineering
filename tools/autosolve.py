@@ -345,7 +345,12 @@ class Specimen:
         if field.endswith("symbol_count"):
             return str(len(self._symnames()))
         if field.endswith("section_count"):
-            return str(e.e_shnum) if e else "none"
+            if e:
+                return str(e.e_shnum)
+            if self.kind == "pe":
+                return str(struct.unpack_from("<H", self.data,
+                           struct.unpack_from("<I", self.data, 0x3c)[0] + 6)[0])
+            return "none"
         if field.endswith("handler_symbols_sha256"):
             ns = sorted(n for n in self._symnames()
                         if re.search(r"event_(success|decoy|failure)", n))
@@ -393,8 +398,12 @@ class Specimen:
     # --- helpers for later-day field computations -------------------------
     def _symnames(self):
         if self._symn is None:
-            self._symn = ([s["name"] for s in self.elf.symbols() if s["name"]]
-                          if self.kind == "elf" else [])
+            if self.kind == "elf":
+                self._symn = [s["name"] for s in self.elf.symbols() if s["name"]]
+            elif self.kind == "pe":
+                self._symn = self._coff_symbols()
+            else:
+                self._symn = []
         return self._symn
 
     def _jar_has(self, entry):
@@ -456,12 +465,8 @@ class Specimen:
 
     def _branch_opcode_count(self):
         t = self._text_bytes()
-        n = 0
-        for i, b in enumerate(t):
-            if 0x70 <= b <= 0x7f:
-                n += 1
-            if b == 0x0f and i + 1 < len(t) and 0x80 <= t[i + 1] <= 0x8f:
-                n += 1
+        n = sum(t.count(b) for b in range(0x70, 0x80))     # short Jcc
+        n += len(re.findall(rb"\x0f[\x80-\x8f]", t))        # near Jcc (0f 8x)
         return n
 
     def _cli_runtime(self):
