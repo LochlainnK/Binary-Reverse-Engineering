@@ -130,6 +130,13 @@ def _scan_bytes(data):
             yield Config(blob, carrier='base64', b64_offset=m.start())
 
 
+def find_config_bytes(data):
+    """Return the first validated Config found in an in-memory byte buffer."""
+    for cfg in _scan_bytes(data):
+        return cfg
+    return None
+
+
 def find_config(path):
     """Return the first validated Config in *path* (handles ELF/PE/JAR)."""
     with open(path, 'rb') as fh:

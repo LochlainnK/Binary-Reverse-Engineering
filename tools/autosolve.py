@@ -190,12 +190,17 @@ class Specimen:
         self._elf = None
         self._cfg = None
         self._cpp = None
+        self._symn = None
 
     def _kind(self):
         if self.data[:4] == b"\x7fELF":
             return "elf"
         if self.data[:2] == b"MZ":
             return "pe"
+        if self.data[:4] == b"\x00asm":
+            return "wasm"
+        if self.data[:3] == b"NEK" or self.data[:5] == b"NEKO\x00":
+            return "neko"
         if self.data[:2] == b"PK":
             return "zip"
         return "unknown"
@@ -233,16 +238,29 @@ class Specimen:
         if field in ("endianness", "analysis_endianness"):
             return e.endianness()
         if field in ("machine", "analysis_machine"):
+            if kind == "integer":          # raw e_machine / IMAGE_FILE_MACHINE code
+                if e:
+                    return str(e.e_machine)
+                if self.kind == "pe":
+                    return str(struct.unpack_from("<H", self.data,
+                               struct.unpack_from("<I", self.data, 0x3c)[0] + 4)[0])
+                return "none"
+            if self.kind == "wasm":
+                return "wasm32"
             return e.machine_short() if e else self._pe_machine()
         if field in ("architecture", "analysis_architecture"):
+            if self.kind == "wasm":
+                return "wasm32"
             return e.machine_short() if e else self._pe_machine()
         if field in ("elf_type", "analysis_elf_type"):
             return e.elf_type()
         if field in ("format", "analysis_format", "cpp_format"):
-            if kind == "exact_text":
-                # exact_text format wants the lowercase container token (e.g. "elf")
-                return {"elf": "elf", "pe": "pe", "zip": "jar"}.get(
-                    self.kind, (self._format() or "").lower())
+            if kind in ("exact_text", "enum"):
+                # lowercase container token; .NET PE -> pe_cli; wasm/jar/neko
+                if self.kind == "pe":
+                    return "pe_cli" if self._is_dotnet() else "pe"
+                return {"elf": "elf", "zip": "jar", "wasm": "wasm",
+                        "neko": "neko_bytecode"}.get(self.kind, (self._format() or "").lower())
             # pattern: managed (.NET) specimens want a compound container+runtime token
             return self._format(compound=self._is_dotnet())
         if field in ("entry_point", "analysis_entry_point"):
@@ -303,6 +321,50 @@ class Specimen:
             return "true" if self._has_hcfg_section() else "false"
         if field in ("compression_methods", "analysis_compression_methods"):
             return _cjson(jar_compression_methods(self.path))
+        # --- extra HCFG json keys (later contracts) ---
+        if field.endswith("config_host_model"):
+            return c.json.get("host_model") if c and c.json else None
+        if field.endswith("config_ipv4"):
+            return c.json.get("ipv4") if c and c.json else None
+        # --- ELF symbol-name counts / predicates ---
+        if field.endswith("crystal_symbol_count"):
+            return str(sum(1 for n in self._symnames()
+                           if re.search(r"Crystal|crystal|__crystal|GC_", n)))
+        if field.endswith("d_symbol_count"):
+            return str(sum(1 for n in self._symnames() if re.search(r"^_D|\b_d_", n)))
+        if field.endswith("handler_symbol_count"):
+            return str(sum(1 for n in self._symnames()
+                           if re.search(r"event_(success|decoy|failure)", n)))
+        if field.endswith("symbol_count"):
+            return str(len(self._symnames()))
+        if field.endswith("section_count"):
+            return str(e.e_shnum) if e else "none"
+        if field.endswith("handler_symbols_sha256"):
+            ns = sorted(n for n in self._symnames()
+                        if re.search(r"event_(success|decoy|failure)", n))
+            return hashlib.sha256("\n".join(ns).encode()).hexdigest()
+        if field.endswith("has_go_runtime"):
+            return "true" if b"runtime.main" in self.data else "false"
+        if field.endswith("has_rust_mangled_symbol"):
+            return "true" if any(n.startswith(("_ZN", "_R")) for n in self._symnames()) else "false"
+        if field.endswith("has_nim_runtime"):
+            return "true" if (b"NimString" in self.data or b"NimMain" in self.data) else "false"
+        if field.endswith("has_fpc_runtime"):
+            return "true" if (b"FPC" in self.data or any("FPC_" in n for n in self._symnames())) else "false"
+        if field.endswith("has_gnat_runtime"):
+            return "true" if (b"__gnat" in self.data or any("gnat" in n for n in self._symnames())) else "false"
+        if field.endswith("has_coroutine_runtime"):
+            return "true" if self._jar_has("kotlin/coroutines/Continuation.class") else "false"
+        if field.endswith("has_decoy_branch"):
+            return "true" if (b"decoy" in self.data or "decoy".encode("utf-16le") in self.data) else "false"
+        if field.endswith("cli_runtime"):
+            return self._cli_runtime()
+        if field.endswith("typeinfo_symbol"):
+            return self._first_symbol_matching(r"ZTI.*DiscoveryEngine")
+        if field.endswith("conditional_branch_opcode_count"):
+            return str(self._branch_opcode_count())
+        if field.endswith("hcfg_storage"):
+            return self._hcfg_storage()
         # --- hashes handled at a higher level (needs file selection) ---
         return None
 
@@ -320,6 +382,96 @@ class Specimen:
         if self.kind == "zip":
             return "JAR"
         return format_label(self.path)
+
+    # --- helpers for later-day field computations -------------------------
+    def _symnames(self):
+        if self._symn is None:
+            self._symn = ([s["name"] for s in self.elf.symbols() if s["name"]]
+                          if self.kind == "elf" else [])
+        return self._symn
+
+    def _jar_has(self, entry):
+        if self.kind != "zip":
+            return False
+        try:
+            return entry in zipfile.ZipFile(self.path).namelist()
+        except Exception:
+            return False
+
+    def _first_symbol_matching(self, pat):
+        rx = re.compile(pat)
+        for n in self._symnames():
+            if rx.search(n):
+                return n
+        # PE / fallback: scan raw for mangled names
+        for m in re.finditer(rb"[A-Za-z_][\w$.@]{3,120}", self.data):
+            s = m.group().decode("latin1")
+            if rx.search(s):
+                return s
+        return "none"
+
+    def _text_bytes(self):
+        if self.kind == "elf" and self.elf:
+            t = next((s for s in self.elf.sections if s["name"] == ".text"), None)
+            if t:
+                return self.data[t["offset"]:t["offset"] + t["size"]]
+        return b""
+
+    def _branch_opcode_count(self):
+        t = self._text_bytes()
+        n = 0
+        for i, b in enumerate(t):
+            if 0x70 <= b <= 0x7f:
+                n += 1
+            if b == 0x0f and i + 1 < len(t) and 0x80 <= t[i + 1] <= 0x8f:
+                n += 1
+        return n
+
+    def _cli_runtime(self):
+        """.NET CLI header runtime major.minor (from the COM descriptor dir)."""
+        try:
+            d = self.data
+            pe = struct.unpack_from("<I", d, 0x3c)[0]
+            opt = pe + 24
+            magic = struct.unpack_from("<H", d, opt)[0]
+            # data directory 14 = CLR runtime header; dir array starts after opt header
+            dir_off = opt + (112 if magic == 0x20b else 96) + 14 * 8
+            rva = struct.unpack_from("<I", d, dir_off)[0]
+            foff = self._pe_rva_to_off(rva)
+            maj = struct.unpack_from("<H", d, foff + 4)[0]
+            minr = struct.unpack_from("<H", d, foff + 6)[0]
+            return f"{maj}.{minr}"
+        except Exception:
+            return "none"
+
+    def _pe_rva_to_off(self, rva):
+        d = self.data
+        pe = struct.unpack_from("<I", d, 0x3c)[0]
+        nsec = struct.unpack_from("<H", d, pe + 6)[0]
+        optsz = struct.unpack_from("<H", d, pe + 20)[0]
+        sec = pe + 24 + optsz
+        for i in range(nsec):
+            b = sec + i * 40
+            va = struct.unpack_from("<I", d, b + 12)[0]
+            vs = struct.unpack_from("<I", d, b + 8)[0]
+            raw = struct.unpack_from("<I", d, b + 20)[0]
+            if va <= rva < va + max(vs, 1):
+                return raw + (rva - va)
+        return rva
+
+    def _hcfg_storage(self):
+        c = self.cfg
+        if not c:
+            return "none"
+        if c.carrier == "base64":
+            return "base64"
+        if self.kind == "wasm":
+            return "wasm_data_segment"
+        if self.kind == "elf" and self.elf and c.file_offset is not None:
+            for s in self.elf.sections:
+                if s["offset"] and s["offset"] <= c.file_offset < s["offset"] + s["size"]:
+                    return "raw_hcfg_section" if s["name"] == ".hcfg" else "raw_const_array"
+        return "raw"
 
     def _pe_section_names(self):
         d = self.data
@@ -434,23 +586,217 @@ def solve(answer_ids, files_or_sets, questions=None):
             return files_or_sets if not _is_setmap(files_or_sets) else files_or_sets.get(0, {})
         return files_or_sets.get(set_idx, {})
 
-    qmap = {q["id"]: q.get("answer_format") for q in (questions or [])}
+    qmap = {q["id"]: q for q in (questions or [])}
     answers, notes = {}, {}
     for aid in answer_ids:
         set_idx, token, field = split_id(aid)
         files = files_for(set_idx)
+        q = qmap.get(aid, {})
+        qtext = q.get("question", "")
+        af = q.get("answer_format")
         try:
+            # day-level fields (operate over all members / the zip itself)
+            dl = _day_level(aid, token, field, files, qtext, af)
+            if dl is not _NOFIELD:
+                answers[aid] = dl
+                continue
             if field in ("sha256", "c_sha256", "cpp_sha256") or \
                re.match(r"artifact_sha256(_\d+)?$", field):
                 path = _sha_target(aid, token, field, files)
                 answers[aid] = sha256_file(path) if path else None
                 continue
-            path = route_file(token, field, files)
-            answers[aid] = spec(path).answer(field, qmap.get(aid)) if path else None
+            # multi-file days: pick the sub-specimen by the question's basename
+            # hint (or a distinguishing basename token), strip adjectives for matching.
+            path, nfield = _subspec(token, field, files, qtext)
+            if path is None:
+                path = route_file(token, field, files)
+                nfield = field
+            answers[aid] = spec(path).answer(nfield, af) if path else None
         except Exception as ex:  # noqa: BLE001
             answers[aid] = None
             notes[aid] = f"ERR {type(ex).__name__}: {ex}"
     return answers, notes
+
+
+def _day_files(token, files):
+    m = re.match(r"d(\d+)", token or "")
+    if not m:
+        return []
+    dd = int(m.group(1))
+    return [(nm, files[nm]) for nm in files   # dict preserves central-directory order
+            if re.search(rf"d0*{dd}[-_.]", nm) and not nm.endswith(".runtimeconfig.json")]
+
+
+_SUBWORDS = ("unoptimized", "optimized", "compact", "direct", "stripped",
+             "symbolized", "corrected", "vulnerable", "loader", "plugin",
+             "primary", "gcc", "tcc", "family", "false", "friend")
+
+
+def _strip_subwords(field):
+    nf = field
+    for w in _SUBWORDS:
+        nf = re.sub(rf"(^|_){w}(_|$)", r"\1", nf)
+    return nf.strip("_")
+
+
+def _subspec(token, field, files, qtext=""):
+    """Choose the member this field concerns and return (path, normalized_field).
+
+    Uses the question's explicit basename hint first ("basename ends X" /
+    "member N"), then a distinguishing basename token appearing in the field.
+    Returns (None, field) when no day files match (let route_file handle it)."""
+    df = _day_files(token, files)
+    if not df:
+        return None, field
+
+    def toks(x):
+        base = re.sub(r"\.(wasm|elf|exe|dll|jar|so|cmxs|bin|njs|neko|n|class|o)$", "",
+                      os.path.basename(x).lower())
+        return set(t for t in re.split(r"[^a-z0-9]+", base) if t)
+    sets = [toks(nm) for nm, _ in df]
+    common = set.intersection(*sets) if sets else set()
+
+    def norm(path):
+        """Strip the chosen file's distinguishing basename tokens + adjectives."""
+        nf = _strip_subwords(field)
+        for t in sorted((toks(path) - common), key=len, reverse=True):
+            if len(t) >= 1:
+                nf = re.sub(rf"(^|_){re.escape(t)}(_|$)", r"\1", nf)
+        return nf.strip("_")
+
+    if len(df) == 1:
+        return df[0][1], norm(df[0][0])
+    m = re.search(r"basename ends (?:with |in )?(\S+)", qtext)
+    if m:
+        suf = m.group(1).strip(". ").lower()
+        for nm, p in df:
+            if nm.lower().endswith(suf):
+                return p, norm(nm)
+    m = re.search(r"\bmember (\d+)\b", qtext)
+    if m:
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < len(df):
+            return df[idx][1], norm(df[idx][0])
+    # a verbatim filename tail named in the question text (longest wins), e.g.
+    # "plugin.cmxs" — robust when the text also mentions the member NOT to use
+    ql = (qtext or "").lower()
+    cands = []
+    for nm, p in df:
+        b = os.path.basename(nm).lower()
+        tail = re.sub(r"^d\d+--(sample[-_]?)?", "", b)
+        for s in (b, tail):
+            if s and s in ql:
+                cands.append((len(s), p, nm))
+    if cands:
+        cands.sort(key=lambda x: x[0], reverse=True)
+        _, p, nm = cands[0]
+        return p, norm(nm)
+    fwords = set(t for t in re.split(r"[^a-z0-9]+", field.lower()) if t)
+    for (nm, p), s in zip(df, sets):
+        if (s - common) & fwords:
+            return p, norm(nm)
+    return df[0][1], norm(df[0][0])
+
+
+_NOFIELD = object()
+
+
+def _day_level(aid, token, field, files, qtext, af):
+    """Fields computed over ALL day members / the zip, not one file.
+    Returns _NOFIELD when the field is not day-level."""
+    import dayextra
+    df = _day_files(token, files)
+    jar = next((p for _, p in df if p.endswith(".jar")), None)
+
+    if field.endswith("structural_artifact_count"):
+        return str(len(df))
+    if field.endswith("structural_ordered_set_sha256"):
+        digs = [hashlib.sha256(open(p, "rb").read()).hexdigest() for _, p in df]
+        return hashlib.sha256(":".join(digs).encode()).hexdigest()
+    if field.endswith("class_count"):
+        total = 0
+        for _, p in df:
+            try:
+                total += sum(1 for n in zipfile.ZipFile(p).namelist() if n.endswith(".class"))
+            except Exception:
+                pass
+        return str(total)
+    # --- crash triage (d26) --- (before Java: 'match_methods' also ends in methods)
+    if jar and field.endswith("crash_fault_method"):
+        t = dayextra.crash_trace(jar)
+        return t["frames"][0] if t and t.get("frames") else "none"
+    if jar and field.endswith("crash_frames_match_methods"):
+        t = dayextra.crash_trace(jar)
+        ci = dayextra.jar_primary_classinfo(jar)
+        if not t or not ci:
+            return "false"
+        mset = set(ci["methods"])
+        return "true" if all(f in mset for f in t.get("frames", [])) else "false"
+    # --- Java classfile fields ---
+    if jar and (field.endswith(("_methods", "_access_flags", "_class_name",
+                                 "_method_count", "_method_names_sha256", "methods"))
+                and "match" not in field and "compression" not in field):
+        try:
+            ci = dayextra.jar_primary_classinfo(jar)
+        except Exception:
+            return _NOFIELD
+        if ci is None:
+            return _NOFIELD
+        if field.endswith("access_flags"):
+            return str(ci["access_flags"])
+        if field.endswith("class_name"):
+            return ci["this_class"]
+        if field.endswith("method_count"):
+            return str(len(ci["methods"]))
+        if field.endswith("method_names_sha256"):
+            names = sorted(set(ci["methods"]))
+            return hashlib.sha256("\n".join(names).encode()).hexdigest()
+        if field.endswith("methods"):
+            return _cjson(ci["methods"])
+    # --- packed/resource overlays (d19 PK19, d20 RS20) ---
+    overlayish = ("overlay" in field or field.endswith("hcfg_resource_size")
+                  or field.endswith(("packing_key_1_hex", "packing_key_2_hex"))
+                  or field.endswith(("config_campaign", "config_domain", "config_url",
+                                      "config_mutex", "config_crc32_hex", "hcfg_version")))
+    if df and overlayish:
+        data0 = open(df[0][1], "rb").read()
+        if b"PK19" in data0:
+            pk = dayextra.pk19(df[0][1])
+            if pk:
+                if field.endswith("overlay_offset"): return str(pk["offset"])
+                if field.endswith("overlay_size"): return str(pk["size"])
+                if field.endswith("packing_key_1_hex"): return f"0x{pk['k1']:02x}"
+                if field.endswith("packing_key_2_hex"): return f"0x{pk['k2']:02x}"
+                cc = pk["config"]
+                if cc:
+                    if field.endswith("config_campaign"): return cc.json.get("campaign")
+                    if field.endswith("config_domain"): return cc.json.get("domain")
+                    if field.endswith("config_url"): return cc.json.get("url")
+                    if field.endswith("config_mutex"): return cc.json.get("mutex")
+                    if field.endswith("config_crc32_hex"): return f"0x{cc.crc32:08x}"
+                    if field.endswith("hcfg_version"): return str(cc.version)
+        elif b"RS20" in data0 and ("overlay" in field or field.endswith("hcfg_resource_size")):
+            rs = dayextra.rs20(df[0][1])
+            if rs:
+                if field.endswith("hcfg_resource_size"): return str(rs["resource_size"])
+                if field.endswith("overlay_offset"): return str(rs["offset"])
+                if field.endswith("overlay_size"): return str(rs["size"])
+    # --- bare config on a multi-member day: use the value common to the
+    # family members (e.g. d28 family-a == family-b, ignore the decoy) ---
+    m = re.match(r"analysis_config_(campaign|domain|url|mutex|crc32_hex)$", field)
+    if m and len(df) > 1:
+        import hcfg as _h
+        from collections import Counter
+        key = m.group(1)
+        vals = []
+        for _, p in df:
+            cc = _h.find_config(p)
+            if cc and cc.json:
+                vals.append(f"0x{cc.crc32:08x}" if key == "crc32_hex" else cc.json.get(key))
+        vals = [v for v in vals if v is not None]
+        if vals:
+            return Counter(vals).most_common(1)[0][0]
+    return _NOFIELD
 
 
 def _is_setmap(d):
@@ -462,7 +808,8 @@ def _sha_target(aid, token, field, files):
     m = re.match(r"d(\d+)", token or "")
     if m:
         dd = int(m.group(1))
-        cands = sorted(nm for nm in files if re.search(rf"d0*{dd}[-_.]", nm))
+        # all members for this day, in central-directory (dict/namelist) order; no sort
+        cands = [nm for nm in files if re.search(rf"d0*{dd}[-_.]", nm)]
         km = re.search(r"_(\d+)$", field)
         idx = (int(km.group(1)) - 1) if km else 0
         if 0 <= idx < len(cands):
