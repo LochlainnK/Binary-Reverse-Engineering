@@ -169,3 +169,28 @@ def hgrf_graph_config(path):
         return None
     g = rec.get("graph", rec)
     return g.get("config") if isinstance(g, dict) else None
+
+
+def hgau(path, magic=b"HGAU"):
+    """Return {'xor_key','crc32','json'} for the last CRC-valid HGAU-layout
+    record (same 12-byte header as HCFG), else None."""
+    import zlib
+    data = open(path, "rb").read()
+    i = len(data)
+    while True:
+        i = data.rfind(magic, 0, i)
+        if i < 0:
+            return None
+        if i + 12 <= len(data):
+            key = data[i + 5]
+            ln = struct.unpack_from("<H", data, i + 6)[0]
+            crc = struct.unpack_from("<I", data, i + 8)[0]
+            if i + 12 + ln <= len(data):
+                pl = bytes(b ^ key for b in data[i + 12:i + 12 + ln])
+                if (zlib.crc32(pl) & 0xffffffff) == crc:
+                    try:
+                        return {"xor_key": key, "crc32": crc, "json": json.loads(pl.decode("utf-8"))}
+                    except Exception:
+                        pass
+        if i == 0:
+            return None

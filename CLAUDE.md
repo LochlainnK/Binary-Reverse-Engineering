@@ -85,6 +85,13 @@ the last CRC-valid one — whose JSON holds the campaign graph; answers come fro
 its `config` object (`dayextra.hgrf_graph_config`). `format` = `neko_bytecode`.
 `solve_day.py` now picks the single_solve that owns the timed chain.
 
+## Day 31 `reversing-gauntlet` (SOLVED)
+Cumulative finale (d01..d31). The new d31 fields come from a single ELF with an
+**HGAU** record (magic `HGAU`, same 12-byte HCFG layout, scan backward for the
+last CRC-valid one; `dayextra.hgau`). JSON has top-level `config.*` and
+`trace.branch`: `config_*` and `gauntlet_config_*` both map to `config.*`,
+`gauntlet_trace_branch` -> `trace.branch`, plus header `xor_key_hex`/`crc32_hex`.
+
 ## Day 30 bonus `sha1-hulud` (standalone flag — UNSOLVED)
 Standalone: one `flag` answer over `sha1-hulud.exe` (Rust PE32+). Not
 scriptable. The `embre` crate obfuscates config strings in `.xsobf` with a
@@ -96,5 +103,5 @@ either running the PE (no Wine in repo apt) or reversing the SHA1-state key.
 
 ## Git
 Work on `main`; commit + push each milestone. Verified `CORRECT`: single_solve
-+ time_trial + mastery for **days 1-30** (fully automated). Only the
++ time_trial + mastery for **days 1-31** (fully automated). Only the
 standalone day-30 `sha1-hulud` flag is outstanding. Never commit the token or downloaded artifacts (`.gitignore`).

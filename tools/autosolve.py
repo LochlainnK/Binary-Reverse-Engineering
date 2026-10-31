@@ -795,6 +795,20 @@ def _day_level(aid, token, field, files, qtext, af):
             return hashlib.sha256("\n".join(names).encode()).hexdigest()
         if field.endswith("methods"):
             return _cjson(ci["methods"])
+    # --- HGAU reversing-gauntlet record (d31): HCFG-layout, nested JSON ---
+    if df and ("HGAU" in qtext or any(b"HGAU" in open(p, "rb").read()[-200000:] for _, p in df[:1])):
+        rec = dayextra.hgau(df[0][1])
+        if rec:
+            j = rec["json"]; cfg = j.get("config", {})
+            if field.endswith("xor_key_hex"):
+                return f"0x{rec['xor_key']:02x}"
+            if field.endswith("crc32_hex"):
+                return f"0x{rec['crc32']:08x}"
+            if field.endswith("trace_branch"):
+                return (j.get("trace", {}) or {}).get("branch")
+            mk = re.search(r"config_(campaign|domain|url|mutex)$", field)
+            if mk and mk.group(1) in cfg:
+                return cfg[mk.group(1)]
     # --- HGRF campaign graph in NEKO members (d30) ---
     mk = re.search(r"config_(campaign|domain|url|mutex)$", field)
     if mk and df and "HGRF" in qtext:
