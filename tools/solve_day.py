@@ -35,10 +35,18 @@ def resolve_ids(day, lane=LANE):
     """Find the single_solve / time_trial / mastery challenge ids for a day."""
     data = json.loads(gm._get({"op": "list", "all": "true"}).decode())
     base = None
-    for ch in data.get("challenges", []):
-        if ch.get("lane") == lane and ch.get("day") == day and ch.get("mode") == "single_solve":
-            base = ch["id"]
+    chs = data.get("challenges", [])
+    timed = {ch["id"] for ch in chs if ch.get("mode") in ("time_trial", "mastery")}
+    singles = [ch["id"] for ch in chs if ch.get("lane") == lane and ch.get("day") == day
+               and ch.get("mode") == "single_solve"]
+    # a day can carry extra standalone single_solves (e.g. day 30's sha1-hulud);
+    # prefer the one that owns the time_trial/mastery chain
+    for sid in singles:
+        if f"{sid}/time_trial" in timed or f"{sid}/mastery" in timed:
+            base = sid
             break
+    if not base and singles:
+        base = singles[0]
     if not base:
         # fall back to a day-scoped listing (handles smart-default omissions)
         data = json.loads(gm._get({"op": "list", "day": str(day), "lane": lane}).decode())

@@ -671,7 +671,7 @@ def _day_files(token, files):
 
 _SUBWORDS = ("unoptimized", "optimized", "compact", "direct", "stripped",
              "symbolized", "corrected", "vulnerable", "loader", "plugin",
-             "primary", "gcc", "tcc", "family", "false", "friend")
+             "primary", "gcc", "tcc", "family", "false", "friend", "capsule")
 
 
 def _strip_subwords(field):
@@ -795,6 +795,25 @@ def _day_level(aid, token, field, files, qtext, af):
             return hashlib.sha256("\n".join(names).encode()).hexdigest()
         if field.endswith("methods"):
             return _cjson(ci["methods"])
+    # --- HGRF campaign graph in NEKO members (d30) ---
+    mk = re.search(r"config_(campaign|domain|url|mutex)$", field)
+    if mk and df and "HGRF" in qtext:
+        ql = qtext.lower()
+        m2 = re.search(r"basename ends (\S+?)\.?(?:\s|$)", ql)
+        target = None
+        if m2:
+            target = next((p for nm, p in df if nm.lower().endswith(m2.group(1))), None)
+        if target is None:  # earliest member tail named in the question text
+            best = None
+            for nm, p in df:
+                tail = re.sub(r"^d\d+--(sample[-_]?)?", "", os.path.basename(nm).lower())
+                pos = ql.find(tail)
+                if pos >= 0 and (best is None or pos < best[0]):
+                    best = (pos, p)
+            target = best[1] if best else df[0][1]
+        cfgj = dayextra.hgrf_graph_config(target)
+        if cfgj and mk.group(1) in cfgj:
+            return cfgj[mk.group(1)]
     # --- packed/resource overlays (d19 PK19, d20 RS20) ---
     overlayish = ("overlay" in field or field.endswith("hcfg_resource_size")
                   or field.endswith(("packing_key_1_hex", "packing_key_2_hex"))

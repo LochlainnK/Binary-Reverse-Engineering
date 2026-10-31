@@ -78,7 +78,14 @@ filename-tail sub-specimen routing; multi-member common-config (d21/d28).
 Calibrate against the highest cumulative single_solve (untimed) — it reveals
 every new field type at once; bisect by day then field.
 
-## Day 30 (`sha1-hulud`, capstone flag — UNSOLVED)
+## Day 30 `multi-binary-campaign` (SOLVED)
+Three NEKO bytecode members (`loader.n`, `library.n`, `config.n`) each carry an
+**HGRF** record — same 12-byte layout as HCFG, magic `HGRF`, scan backward for
+the last CRC-valid one — whose JSON holds the campaign graph; answers come from
+its `config` object (`dayextra.hgrf_graph_config`). `format` = `neko_bytecode`.
+`solve_day.py` now picks the single_solve that owns the timed chain.
+
+## Day 30 bonus `sha1-hulud` (standalone flag — UNSOLVED)
 Standalone: one `flag` answer over `sha1-hulud.exe` (Rust PE32+). Not
 scriptable. The `embre` crate obfuscates config strings in `.xsobf` with a
 SplitMix-style per-index keystream (seed = a `mov eax,SEED` immediate; decoder
@@ -89,5 +96,5 @@ either running the PE (no Wine in repo apt) or reversing the SHA1-state key.
 
 ## Git
 Work on `main`; commit + push each milestone. Verified `CORRECT`: single_solve
-+ time_trial + mastery for **days 1-29** (fully automated). Day 30 flag
-outstanding. Never commit the token or downloaded artifacts (`.gitignore`).
++ time_trial + mastery for **days 1-30** (fully automated). Only the
+standalone day-30 `sha1-hulud` flag is outstanding. Never commit the token or downloaded artifacts (`.gitignore`).

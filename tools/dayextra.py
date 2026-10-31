@@ -135,3 +135,37 @@ def rs20(path):
     # RS20(4) version(u32) resource_size(u32le @ +8) ...
     size = struct.unpack_from("<I", d, i + 8)[0]
     return {"offset": i, "size": len(d) - i, "resource_size": size, "raw": d[i:]}
+
+
+# --------------------------------------------------------------------------
+# HGRF (day 30): HCFG-layout record holding a campaign graph JSON
+# --------------------------------------------------------------------------
+def find_record_backward(data, magic=b"HGRF"):
+    """Last CRC32-valid record with the HCFG 12-byte layout, scanning backward."""
+    import zlib
+    i = len(data)
+    while True:
+        i = data.rfind(magic, 0, i)
+        if i < 0:
+            return None
+        if i + 12 <= len(data):
+            key = data[i + 5]
+            ln = struct.unpack_from("<H", data, i + 6)[0]
+            crc = struct.unpack_from("<I", data, i + 8)[0]
+            if i + 12 + ln <= len(data):
+                pl = bytes(b ^ key for b in data[i + 12:i + 12 + ln])
+                if (zlib.crc32(pl) & 0xffffffff) == crc:
+                    try:
+                        return json.loads(pl.decode("utf-8"))
+                    except Exception:
+                        pass
+        if i == 0:
+            return None
+
+
+def hgrf_graph_config(path):
+    rec = find_record_backward(open(path, "rb").read())
+    if not rec:
+        return None
+    g = rec.get("graph", rec)
+    return g.get("config") if isinstance(g, dict) else None
