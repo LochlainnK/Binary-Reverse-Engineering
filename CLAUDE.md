@@ -63,7 +63,31 @@ field it can't answer (a genuinely new field type / container). Calibrate it on
 the single_solve or time_trial (abundant/untimed), bake the rule into
 `autosolve.py` `Specimen.answer()` (or `hcfg.py`/`elfmeta.py`), then rerun.
 
+## Days 16-29 (added field types)
+The cumulative schemes grew richer. `tools/dayextra.py` + `Specimen.answer`
+now cover: wasm/neko containers; `format` enum (elf/pe/pe_cli/jar/wasm/
+neko_bytecode) and integer `machine` (e_machine); PE fallbacks for
+section_count/section_names/symbols (COFF); extra HCFG keys (host_model,
+ipv4); runtime predicates (go/rust/nim/fpc/gnat/crystal/d/coroutine/decoy) and
+symbol counts; **PE COFF symbol names keep the `.rdata$`/`.text$` prefix**
+(day-2 typeinfo/vtable/mangled_score); conditional-branch opcode count
+(vectorised); hcfg_storage classification; Java classfile parsing
+(methods/access_flags/class_name/counts) + crash trace (d26); PK19/RS20
+packed overlays (d19/d20); structural counts/hashes; question-text + verbatim
+filename-tail sub-specimen routing; multi-member common-config (d21/d28).
+Calibrate against the highest cumulative single_solve (untimed) — it reveals
+every new field type at once; bisect by day then field.
+
+## Day 30 (`sha1-hulud`, capstone flag — UNSOLVED)
+Standalone: one `flag` answer over `sha1-hulud.exe` (Rust PE32+). Not
+scriptable. The `embre` crate obfuscates config strings in `.xsobf` with a
+SplitMix-style per-index keystream (seed = a `mov eax,SEED` immediate; decoder
+reversed — registry paths + anti-debug tool names, no flag). The flag is
+revealed only when `is_unlocked(state)` holds (anti-analysis checks pass) and
+is keyed by **SHA1** of the unlocked state (init constants present). Needs
+either running the PE (no Wine in repo apt) or reversing the SHA1-state key.
+
 ## Git
-Work on `main`; commit + push each milestone. Verified `CORRECT`: mastery days
-8, 9, 10, 14 (fully automated). Never commit the token or downloaded artifacts
-(`.gitignore` covers them).
+Work on `main`; commit + push each milestone. Verified `CORRECT`: single_solve
++ time_trial + mastery for **days 1-29** (fully automated). Day 30 flag
+outstanding. Never commit the token or downloaded artifacts (`.gitignore`).
